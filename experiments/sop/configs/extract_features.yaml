@@ -1,0 +1,36 @@
+postfix: metric_learning_cars
+
+precision: 32
+device: cuda
+
+dataframe_name: df.csv
+dataset_root: data/
+
+num_workers: 4
+
+transforms_train:
+  name: augs_hypvit_torch
+  args:
+    im_size: 224
+
+transforms_val:
+  name: norm_resize_hypvit_torch
+  args:
+    im_size: 224
+    crop_size: 224
+
+bs_val: 256
+bs_train: 256
+n_passes_train: 32
+n_passes_valid: 1
+
+train_features_filepath: data/train_features.npz
+valid_features_filepath: data/valid_features.npz
+
+model:
+  name: vit
+  args:
+    normalise_features: True
+    use_multi_scale: False
+    weights: vits16_sop
+    arch: vits16

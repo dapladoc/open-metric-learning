@@ -1,0 +1,73 @@
+postfix: metric_learning
+
+seed: 42
+precision: 16
+accelerator: gpu
+devices: 1
+
+train_npz: train_features.npz
+valid_npz: valid_features.npz
+dataset_root: /home/aron/PycharmProjects/open-metric-learning/experiments/sop/data/
+logs_root: logs/Stanford_Online_Products/
+logs_folder: ${now:%Y-%m-%d_%H-%M-%S}_${postfix}
+
+num_workers: 4
+
+metric_args:
+  metrics_to_exclude_from_visualization: [cmc,]
+  cmc_top_k: [1]
+  map_top_k: [5]
+  fmr_vals: []  # Since SOP is a big dataset you should be careful with increasing of the memory footprint, which is needed to calculate fmr
+  pfc_variance: []
+  return_only_main_category: True
+  visualize_only_main_category: True
+
+sampler:
+  name: category_balance
+  args:
+    n_labels: 24
+    n_instances: 6
+    n_categories: 3
+    resample_labels: True
+    weight_categories: True
+
+miner:
+  name: all_triplets
+  args:
+    max_output_triplets: 2048
+
+bs_val: 256
+max_epochs: 10000
+valid_period: 1
+
+criterion:
+  args:
+    need_logs: True
+    margin: null
+    reduction: mean
+
+optimizer:
+  name: adam
+  args:
+    lr: 1e-5  # if you provide scheduler this parameter will be ignored
+
+scheduling: null
+
+
+# To use neptune you should also specify NEPTUNE_API_TOKEN in
+# .env file or via `export NEPTUNE_API_TOKEN=...`
+neptune_project: aron.dik/OML-SOP
+# neptune_project: null
+
+
+hydra_dir: ${logs_root}/${logs_folder}/
+
+tags:
+  - ${postfix}
+  - sop
+
+hydra:
+  run:
+    dir: ${hydra_dir}
+  searchpath:
+   - pkg://oml.configs
