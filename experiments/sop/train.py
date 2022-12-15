@@ -7,10 +7,10 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import NeptuneLogger
 from torch.utils.data import DataLoader
 
-from experiments.cars.datasets import DatasetQueryGallery, DatasetWithLabels
-from experiments.cars.losses import TripletLoss
-from experiments.cars.metrics import EmbeddingMetrics
-from experiments.cars.models import RetrievalModule, SiamNet
+from experiments.sop.datasets import DatasetQueryGallery, DatasetWithLabels
+from experiments.sop.losses import TripletLoss
+from experiments.sop.metrics import EmbeddingMetrics
+from experiments.sop.models import RetrievalModule, SiamNet
 from oml.const import PROJECT_ROOT, TCfg
 from oml.lightning.callbacks.metric import MetricValCallback
 from oml.lightning.entrypoints.parser import (

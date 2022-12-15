@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Union
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 
 from experiments.sop.losses import TripletLoss
@@ -99,17 +100,48 @@ class RetrievalModule(pl.LightningModule):
         return tqdm_dict
 
     def on_epoch_end(self) -> None:
-        ones = self.model.one.detach().cpu().numpy()
-        np.save(str(self.ones_path / f"{self.ones_save_count:05}.npy"), ones)
-        self.ones_save_count += 1
+        pass
+        # ones = self.model.one.detach().cpu().numpy()
+        # np.save(str(self.ones_path / f"{self.ones_save_count:05}.npy"), ones)
+        # self.ones_save_count += 1
+
+
+class Attention(torch.nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, attn
 
 
 class SiamNet(torch.nn.Module):
     def __init__(self, n_dims: int):
         super().__init__()
-        self.one = torch.nn.Parameter(torch.ones(n_dims, 1) + (1.0e-4 * torch.rand(n_dims, 1) - 1.0e-4 / 2))
+        self.attention = Attention(n_dims)
 
     def forward(self, x1, x2):
+        ones, attn = self.attention(torch.cat((x1.unsqueeze(1), x2.unsqueeze(1)), dim=1))
+        one = ones.sum(dim=1)
+        one = one / torch.linalg.vector_norm(one, dim=1, keepdim=True)
         diff = torch.pow(x1 - x2, 2)
-        scores = torch.matmul(diff, self.one / torch.linalg.vector_norm(self.one))
+        scores = (diff * one).sum(dim=1)
         return scores
