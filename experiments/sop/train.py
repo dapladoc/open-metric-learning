@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from experiments.sop.datasets import DatasetQueryGallery, DatasetWithLabels
 from experiments.sop.losses import TripletLoss
 from experiments.sop.metrics import EmbeddingMetrics
+from experiments.sop.miners import HardTripletsMiner
 from experiments.sop.models import RetrievalModule, SiamNet
 from oml.const import PROJECT_ROOT, TCfg
 from oml.lightning.callbacks.metric import MetricValCallback
@@ -17,7 +18,7 @@ from oml.lightning.entrypoints.parser import (
     check_is_config_for_ddp,
     parse_engine_params_from_config,
 )
-from oml.registry.miners import get_miner_by_cfg
+from oml.registry.miners import MINERS_REGISTRY, get_miner, get_miner_by_cfg
 from oml.registry.optimizers import get_optimizer_by_cfg
 from oml.registry.samplers import get_sampler_by_cfg
 from oml.registry.schedulers import get_scheduler_by_cfg
@@ -27,6 +28,8 @@ from oml.utils.misc import (
     load_dotenv,
     set_global_seed,
 )
+
+MINERS_REGISTRY["hard_triplets"] = HardTripletsMiner
 
 
 def pl_train(cfg: TCfg) -> None:
@@ -58,8 +61,6 @@ def pl_train(cfg: TCfg) -> None:
     # note, we pass some runtime arguments to sampler here, but not all of the samplers use all of these arguments
     sampler = get_sampler_by_cfg(cfg["sampler"], **sampler_runtime_args) if cfg["sampler"] is not None else None
 
-    miner = get_miner_by_cfg(cfg["miner"])
-
     model = SiamNet(train_dataset.get_n_dims())
     criterion = TripletLoss(model, **cfg["criterion"]["args"])
     optimizable_parameters = [{"lr": cfg["optimizer"]["args"]["lr"], "params": model.parameters()}]
@@ -89,6 +90,7 @@ def pl_train(cfg: TCfg) -> None:
 
     loaders_val = DataLoader(dataset=valid_dataset, batch_size=cfg["bs_val"], num_workers=cfg["num_workers"])
 
+    miner = get_miner(cfg["miner"]["name"], model=model, **cfg["miner"]["args"])
     module_kwargs = scheduler_kwargs
 
     pl_model = RetrievalModule(
@@ -112,8 +114,8 @@ def pl_train(cfg: TCfg) -> None:
     metrics_clb = MetricValCallback(metric=metrics_calc, log_images=cfg.get("log_images", False))
     ckpt_clb = pl.callbacks.ModelCheckpoint(
         dirpath=Path.cwd() / "checkpoints",
-        monitor="triplet_loss_epoch",
-        mode="min",
+        monitor=cfg["metric_for_checkpointing"],
+        mode="max",
         save_top_k=1,
         verbose=True,
         filename="best",
@@ -156,15 +158,15 @@ def pl_train(cfg: TCfg) -> None:
         **trainer_engine_params,
     )
     # trainer.validate(dataloaders=loaders_val, verbose=True, model=pl_model)
-
+    # return
     if is_ddp:
         trainer.fit(model=pl_model)
     else:
-        # trainer.fit(model=pl_model, train_dataloaders=loader_train, val_dataloaders=loaders_val)
-        trainer.fit(model=pl_model, train_dataloaders=loader_train)
+        trainer.fit(model=pl_model, train_dataloaders=loader_train, val_dataloaders=loaders_val)
+        # trainer.fit(model=pl_model, train_dataloaders=loader_train)
 
 
-@hydra.main(config_path="configs", config_name="train_sop.yaml")
+@hydra.main(config_path="configs", config_name="train_cars.yaml")
 def main(cfg):
     pl_train(cfg)
 

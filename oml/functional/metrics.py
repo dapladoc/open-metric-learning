@@ -106,6 +106,8 @@ def calc_retrieval_metrics(
 
     if fmr_vals:
         pos_dist, neg_dist = extract_pos_neg_dists(distances, mask_gt, mask_to_ignore)
+        metrics["pos_mean"] = pos_dist.mean()
+        metrics["neg_mean"] = neg_dist.mean()
         fnmr_at_fmr = calc_fnmr_at_fmr(pos_dist, neg_dist, fmr_vals)
         metrics["fnmr@fmr"] = dict(zip(fmr_vals, fnmr_at_fmr))
 

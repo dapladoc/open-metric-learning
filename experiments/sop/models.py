@@ -4,12 +4,15 @@ from typing import Any, Dict, Optional, Union
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.functional as F
 from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 
 from experiments.sop.losses import TripletLoss
 from oml.const import EMBEDDINGS_KEY, LABELS_KEY
 from oml.interfaces.miners import ITripletsMiner, labels2list
+from oml.models.vit.vision_transformer import DropPath, Mlp
+from oml.utils.misc_torch import elementwise_dist
 
 
 class RetrievalModule(pl.LightningModule):
@@ -63,7 +66,10 @@ class RetrievalModule(pl.LightningModule):
         bs = len(labels)
 
         labels_list = labels2list(labels)
-        anchor, positive, negative = self.miner.sample(features=features, labels=labels_list)
+        anchor, positive, negative, *rest = self.miner.sample(features=features, labels=labels_list)
+        if rest:
+            self.log("hardest positive distances mean", np.mean(rest[0]).item())
+            self.log("hardest negative distances mean", np.mean(rest[1]).item())
         loss = self.criterion(anchor=anchor, positive=positive, negative=negative)
 
         loss_name = (getattr(self.criterion, "criterion_name", "") + "_loss").strip("_")
@@ -130,18 +136,108 @@ class Attention(torch.nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, attn
+        return x
+
+
+class Attention2(torch.nn.Module):
+    def __init__(self, n_dims: int):
+        super().__init__()
+        self.n_dims = n_dims
+        self.linear = nn.Linear(n_dims, n_dims)
+
+    def forward(self, x):
+        return torch.sigmoid(self.linear(x))
+
+
+class Attention3(torch.nn.Module):
+    def __init__(self, n_dims: int):
+        super().__init__()
+        self.n_dims = n_dims
+        self.linear = nn.Linear(2 * n_dims, n_dims * n_dims * 2)
+
+    def forward(self, x):
+        output = torch.tanh(self.linear(x))
+        output = output.view(self.n_dims, self.n_dims * 2)
+        return output
+
+
+class Block(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        y = self.attn(self.norm1(x))
+        x = x + self.drop_path(y)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
 
 
 class SiamNet(torch.nn.Module):
-    def __init__(self, n_dims: int):
+    def __init__(self, n_dims):
         super().__init__()
-        self.attention = Attention(n_dims)
+        self.n_dims = n_dims
+        self.block_1 = Block(
+            n_dims,
+            num_heads=1,
+            mlp_ratio=4.0,
+            qkv_bias=False,
+            qk_scale=None,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+        )
+        self.block_2 = Block(
+            n_dims,
+            num_heads=1,
+            mlp_ratio=4.0,
+            qkv_bias=False,
+            qk_scale=None,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+        )
+        self.block_3 = Block(
+            n_dims,
+            num_heads=1,
+            mlp_ratio=4.0,
+            qkv_bias=False,
+            qk_scale=None,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+        )
 
     def forward(self, x1, x2):
-        ones, attn = self.attention(torch.cat((x1.unsqueeze(1), x2.unsqueeze(1)), dim=1))
-        one = ones.sum(dim=1)
-        one = one / torch.linalg.vector_norm(one, dim=1, keepdim=True)
-        diff = torch.pow(x1 - x2, 2)
-        scores = (diff * one).sum(dim=1)
-        return scores
+        x = torch.cat((x1.unsqueeze(1), x2.unsqueeze(1)), dim=1)
+        x = self.block_1(x)
+        x = self.block_2(x)
+        x = self.block_3(x).permute(1, 0, 2)
+        x1, x2 = x
+        dist = elementwise_dist(x1, x2, p=2)
+        return dist

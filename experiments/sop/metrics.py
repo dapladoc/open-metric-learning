@@ -366,6 +366,8 @@ def pairwise_dist(model: torch.nn.Module, x1: torch.Tensor, x2: torch.Tensor, bs
     i2 = i2.reshape(-1)
     i = 0
     scores = torch.empty(i1.shape[0], device=original_device)
+    mode = model.training
+    model.eval()
     with torch.no_grad():
         progress_bar = tqdm(total=i1.shape[0])
         while i * bs < i1.shape[0]:
@@ -377,7 +379,9 @@ def pairwise_dist(model: torch.nn.Module, x1: torch.Tensor, x2: torch.Tensor, bs
             _x2 = x2[_i2, :]
             scores[_a:_b] = model.forward(_x1, _x2).to(original_device).squeeze()
             i += 1
-            progress_bar.update(bs)
+            progress_bar.update(_b - _a)
         progress_bar.close()
+    if mode:
+        model.train()
     scores = scores.reshape(x1.shape[0], x2.shape[0])
     return scores

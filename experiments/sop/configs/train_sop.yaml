@@ -17,10 +17,12 @@ metric_args:
   metrics_to_exclude_from_visualization: [cmc,]
   cmc_top_k: [1]
   map_top_k: [5]
-  fmr_vals: []  # Since SOP is a big dataset you should be careful with increasing of the memory footprint, which is needed to calculate fmr
+  fmr_vals: [1]  # Since SOP is a big dataset you should be careful with increasing of the memory footprint, which is needed to calculate fmr
   pfc_variance: []
   return_only_main_category: True
   visualize_only_main_category: True
+
+metric_for_checkpointing: OVERALL/cmc/1
 
 sampler:
   name: category_balance
@@ -32,9 +34,9 @@ sampler:
     weight_categories: True
 
 miner:
-  name: all_triplets
+  name: hard_triplets
   args:
-    max_output_triplets: 2048
+    bs: 4096
 
 bs_val: 256
 max_epochs: 10000
@@ -51,8 +53,38 @@ optimizer:
   args:
     lr: 1e-5  # if you provide scheduler this parameter will be ignored
 
+
+#optimizer:
+#  name: sgd
+#  args:
+#    momentum: 0.9
+#    lr: 1e-1  # if you provide scheduler this parameter will be ignored
+#    weight_decay: 1e-4
+#    nesterov: True
+#    dampening: 0
+
 scheduling: null
 
+#scheduling:
+#  scheduler:
+#    name: cyclic
+#    args:
+#      base_lr: 1e-5
+#      max_lr: 1
+#      step_size_up: 50
+#      mode: triangular
+#  scheduler_interval: epoch
+#  scheduler_frequency: 1
+#  scheduler:
+#    name: reduce_on_plateau
+#    args:
+#      factor: 0.75
+#      patience: 50
+#      verbose: True
+#      cooldown: 10
+#  scheduler_interval: epoch
+#  scheduler_frequency: 1
+#  monitor_metric: triplet_loss
 
 # To use neptune you should also specify NEPTUNE_API_TOKEN in
 # .env file or via `export NEPTUNE_API_TOKEN=...`
