@@ -7,6 +7,7 @@ devices: 1
 
 train_npz: train_features.npz
 valid_npz: valid_features.npz
+valid_top_k: valid_features_top_100.npz
 dataset_root: /home/aron/PycharmProjects/open-metric-learning/experiments/sop/data/
 logs_root: logs/Stanford_Online_Products/
 logs_folder: ${now:%Y-%m-%d_%H-%M-%S}_${postfix}

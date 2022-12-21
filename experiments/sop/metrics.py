@@ -1,3 +1,5 @@
+import warnings
+from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
 from typing import Any, Collection, Dict, Iterable, List, Optional, Tuple, Union
@@ -32,16 +34,20 @@ from oml.functional.metrics import (
     _to_tensor,
     apply_mask_to_ignore,
     calc_gt_mask,
-    calc_mask_to_ignore,
-    calc_retrieval_metrics,
     calc_topological_metrics,
     reduce_metrics,
+    validate_dataset,
+    calc_cmc,
+    calc_precision,
+    calc_map,
+    extract_pos_neg_dists,
+    calc_fnmr_at_fmr,
 )
 from oml.interfaces.metrics import IMetricDDP, IMetricVisualisable
 from oml.interfaces.post_processor import IPostprocessor
 from oml.metrics.accumulation import Accumulator
 from oml.utils.images.images import get_img_with_bbox, square_pad
-from oml.utils.misc import flatten_dict
+from oml.utils.misc import flatten_dict, clip_max
 
 TMetricsDict_ByLabels = Dict[Union[str, int], TMetricsDict]
 
@@ -71,6 +77,8 @@ class EmbeddingMetrics(IMetricVisualisable):
         visualize_only_main_category: bool = True,
         verbose: bool = True,
         bs: bool = 128,
+        validation_top_k_ids: Optional[np.ndarray] = None,
+        validation_gt: Optional[np.ndarray] = None,
     ):
         self.model = model
         self.embeddings_key = embeddings_key
@@ -92,6 +100,8 @@ class EmbeddingMetrics(IMetricVisualisable):
         self.metrics = None
         self.mask_to_ignore = None
         self.bs = bs
+        self.validation_top_k_ids = validation_top_k_ids
+        self.validation_gt = validation_gt
 
         self.check_dataset_validity = check_dataset_validity
         self.visualize_only_main_category = visualize_only_main_category
@@ -131,10 +141,17 @@ class EmbeddingMetrics(IMetricVisualisable):
 
         # Note, in some of the datasets part of the samples may appear in both query & gallery.
         # Here we handle this case to avoid picking an item itself as the nearest neighbour for itself
-        self.mask_to_ignore = calc_mask_to_ignore(is_query=is_query, is_gallery=is_gallery)
-        self.mask_gt = calc_gt_mask(labels=labels, is_query=is_query, is_gallery=is_gallery)
+        if self.validation_top_k_ids is None:
+            self.mask_to_ignore = calc_mask_to_ignore(is_query=is_query, is_gallery=is_gallery)
+        if self.validation_gt is None:
+            self.mask_gt = calc_gt_mask(labels=labels, is_query=is_query, is_gallery=is_gallery)
         self.distance_matrix = calc_distance_matrix(
-            model=self.model, embeddings=embeddings, is_query=is_query, is_gallery=is_gallery, bs=self.bs
+            model=self.model,
+            embeddings=embeddings,
+            is_query=is_query,
+            is_gallery=is_gallery,
+            bs=self.bs,
+            validation_top_k_ids=self.validation_top_k_ids,
         )
 
     def compute_metrics(self) -> TMetricsDict_ByLabels:  # type: ignore
@@ -152,6 +169,8 @@ class EmbeddingMetrics(IMetricVisualisable):
             "precision_top_k": self.precision_top_k,
             "map_top_k": self.map_top_k,
             "fmr_vals": self.fmr_vals,
+            "validation_top_k_ids": self.validation_top_k_ids,
+            "validation_gt": self.validation_gt,
         }
         args_topological_metrics = {"pfc_variance": self.pfc_variance}
 
@@ -338,6 +357,7 @@ def calc_distance_matrix(
     is_query: Union[np.ndarray, torch.Tensor],
     is_gallery: Union[np.ndarray, torch.Tensor],
     bs: int,
+    validation_top_k_ids: Optional[np.ndarray] = None,
 ) -> torch.Tensor:
     assert all(isinstance(vector, (np.ndarray, torch.Tensor)) for vector in [embeddings, is_query, is_gallery])
     assert is_query.ndim == 1 and is_gallery.ndim == 1 and embeddings.ndim == 2
@@ -350,20 +370,24 @@ def calc_distance_matrix(
     query_embeddings = embeddings[query_mask]
     gallery_embeddings = embeddings[gallery_mask]
 
-    distance_matrix = pairwise_dist(model=model, x1=query_embeddings, x2=gallery_embeddings, bs=bs)
+    distance_matrix = pairwise_dist(
+        model=model, x1=query_embeddings, x2=gallery_embeddings, bs=bs, top_k_ids=validation_top_k_ids
+    )
 
     return distance_matrix
 
 
-def pairwise_dist(model: torch.nn.Module, x1: torch.Tensor, x2: torch.Tensor, bs: int) -> torch.Tensor:
+def pairwise_dist(
+    model: torch.nn.Module, x1: torch.Tensor, x2: torch.Tensor, bs: int, top_k_ids: Optional[np.ndarray] = None
+) -> torch.Tensor:
+    if top_k_ids is None:
+        top_k_ids = np.arange(x2.shape[0]).reshape(1, -1).repeat(x1.shape[1], axis=0)
     original_device = x1.device
     x1 = x1.to(next(model.parameters()))
     x2 = x2.to(next(model.parameters()))
-    i1 = torch.arange(x1.shape[0])
-    i2 = torch.arange(x2.shape[0])
-    i1, i2 = torch.meshgrid(i1, i2)
-    i1 = i1.reshape(-1)
-    i2 = i2.reshape(-1)
+    i1 = np.arange(x1.shape[0])
+    i1 = np.repeat(i1, top_k_ids.shape[1])
+    i2 = top_k_ids.flatten()
     i = 0
     scores = torch.empty(i1.shape[0], device=original_device)
     mode = model.training
@@ -383,5 +407,135 @@ def pairwise_dist(model: torch.nn.Module, x1: torch.Tensor, x2: torch.Tensor, bs
         progress_bar.close()
     if mode:
         model.train()
-    scores = scores.reshape(x1.shape[0], x2.shape[0])
+    scores = scores.reshape(top_k_ids.shape)
     return scores
+
+
+def calc_mask_to_ignore(
+    is_query: Union[np.ndarray, torch.Tensor], is_gallery: Union[np.ndarray, torch.Tensor], valid_top_k=None
+) -> torch.Tensor:
+    assert all(isinstance(vector, (np.ndarray, torch.Tensor)) for vector in [is_query, is_gallery])
+    assert is_query.ndim == is_gallery.ndim == 1
+    assert len(is_query) == len(is_gallery)
+
+    is_query, is_gallery = map(_to_tensor, [is_query, is_gallery])
+
+    ids_query = torch.nonzero(is_query).squeeze()
+    ids_gallery = torch.nonzero(is_gallery).squeeze()
+    mask_to_ignore = ids_query[..., None] == ids_gallery[None, ...]
+
+    return mask_to_ignore
+
+
+def calc_retrieval_metrics(
+    distances: torch.Tensor,
+    mask_gt: torch.Tensor,
+    mask_to_ignore: Optional[torch.Tensor] = None,
+    cmc_top_k: Tuple[int, ...] = (5,),
+    precision_top_k: Tuple[int, ...] = (5,),
+    map_top_k: Tuple[int, ...] = (5,),
+    fmr_vals: Tuple[int, ...] = (1,),
+    reduce: bool = True,
+    check_dataset_validity: bool = False,
+    validation_top_k_ids: Optional[np.ndarray] = None,
+    validation_gt: Optional[np.ndarray] = None,
+) -> TMetricsDict:
+    """
+    Function to count different retrieval metrics.
+
+    Args:
+        distances: Distance matrix with the shape of ``[query_size, gallery_size]``
+        mask_gt: ``(i,j)`` element indicates if for ``i``-th query ``j``-th gallery is the correct prediction
+        mask_to_ignore: Binary matrix to indicate that some elements in the gallery cannot be used
+                     as answers and must be ignored
+        cmc_top_k: Values of ``k`` to calculate ``cmc@k`` (`Cumulative Matching Characteristic`)
+        precision_top_k: Values of ``k`` to calculate ``precision@k``
+        map_top_k: Values of ``k`` to calculate ``map@k`` (`Mean Average Precision`)
+        fmr_vals: Values of ``fmr`` (measured in percents) to calculate ``fnmr@fmr`` (`False Non Match Rate
+                  at the given False Match Rate`).
+                  For example, if ``fmr_values`` is (20, 40) we will calculate ``fnmr@fmr=20`` and ``fnmr@fmr=40``
+        reduce: If ``False`` return metrics for each query without averaging
+        check_dataset_validity: Set ``True`` if you want to check that we have available answers in the gallery for
+         each of the queries
+
+    Returns:
+        Metrics dictionary.
+
+    """
+    top_k_args = [cmc_top_k, precision_top_k, map_top_k]
+
+    if not any(top_k_args + [fmr_vals]):
+        raise ValueError("You must specify arguments for at leas 1 metric to calculate it")
+
+    if check_dataset_validity:
+        validate_dataset(mask_gt=mask_gt, mask_to_ignore=mask_to_ignore)
+
+        if distances.shape != mask_gt.shape:
+            raise ValueError(
+                f"Distances matrix has the shape of {distances.shape}, "
+                f"but mask_to_ignore has the shape of {mask_gt.shape}."
+            )
+
+    if (mask_to_ignore is not None) and (mask_to_ignore.shape != distances.shape):
+        raise ValueError(
+            f"Distances matrix has the shape of {distances.shape}, "
+            f"but mask_to_ignore has the shape of {mask_to_ignore.shape}."
+        )
+
+    query_sz, gallery_sz = distances.shape
+
+    for top_k_arg in top_k_args:
+        for k in top_k_arg:
+            if k > gallery_sz:
+                warnings.warn(
+                    f"Your desired k={k} more than gallery_size={gallery_sz}."
+                    f"We'll calculate metrics with k limited by the gallery size."
+                )
+
+    if mask_to_ignore is not None:
+        distances, mask_gt = apply_mask_to_ignore(distances=distances, mask_gt=mask_gt, mask_to_ignore=mask_to_ignore)
+
+    cmc_top_k_clipped = clip_max(cmc_top_k, gallery_sz)
+    precision_top_k_clipped = clip_max(precision_top_k, gallery_sz)
+    map_top_k_clipped = clip_max(map_top_k, gallery_sz)
+
+    max_k = max([*cmc_top_k, *precision_top_k, *map_top_k])
+    max_k = min(max_k, gallery_sz)
+
+    if validation_gt is None:
+        _, ii_top_k = torch.topk(distances, k=max_k, largest=False)
+        ii_arange = torch.arange(query_sz).unsqueeze(-1).expand(query_sz, max_k)
+        gt_tops = mask_gt[ii_arange, ii_top_k]
+        n_gt = mask_gt.sum(dim=1)
+    else:
+        gt_tops = torch.from_numpy(validation_gt)
+        n_gt = gt_tops.sum(dim=1)
+
+    metrics: TMetricsDict = defaultdict(dict)
+
+    if cmc_top_k:
+        cmc = calc_cmc(gt_tops, cmc_top_k_clipped)
+        metrics["cmc"] = dict(zip(cmc_top_k, cmc))
+
+    if precision_top_k:
+        precision = calc_precision(gt_tops, n_gt, precision_top_k_clipped)
+        metrics["precision"] = dict(zip(precision_top_k, precision))
+
+    if map_top_k:
+        map = calc_map(gt_tops, n_gt, map_top_k_clipped)
+        metrics["map"] = dict(zip(map_top_k, map))
+
+    if fmr_vals:
+        if validation_gt is not None:
+            pos_dist, neg_dist = extract_pos_neg_dists(distances, gt_tops, mask_to_ignore)
+        else:
+            pos_dist, neg_dist = extract_pos_neg_dists(distances, mask_gt, mask_to_ignore)
+        metrics["pos_mean"] = pos_dist.mean()
+        metrics["neg_mean"] = neg_dist.mean()
+        fnmr_at_fmr = calc_fnmr_at_fmr(pos_dist, neg_dist, fmr_vals)
+        metrics["fnmr@fmr"] = dict(zip(fmr_vals, fnmr_at_fmr))
+
+    if reduce:
+        metrics = reduce_metrics(metrics)
+
+    return metrics
